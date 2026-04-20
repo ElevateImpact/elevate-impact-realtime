@@ -65,7 +65,7 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 // Health check endpoint
-app.MapGet("/api/health", async (Npgsql.NpgsqlDataSource db) =>
+app.MapGet("/api/health", async (Npgsql.NpgsqlDataSource db, ILogger<Program> logger) =>
 {
     try
     {
@@ -75,9 +75,10 @@ app.MapGet("/api/health", async (Npgsql.NpgsqlDataSource db) =>
         await cmd.ExecuteScalarAsync();
         return Results.Ok(new { status = "healthy" });
     }
-    catch
+    catch (Exception ex)
     {
-        return Results.Json(new { status = "unhealthy" }, statusCode: 503);
+        logger.LogError(ex, "Health check failed");
+        return Results.Json(new { status = "unhealthy", error = ex.Message }, statusCode: 503);
     }
 });
 
