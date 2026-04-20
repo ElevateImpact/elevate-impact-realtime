@@ -9,6 +9,9 @@ using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Load .env file locally if it exists
+DotNetEnv.Env.TraversePath().Load();
+
 // Environment variables
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL")
     ?? throw new InvalidOperationException("DATABASE_URL is required");
