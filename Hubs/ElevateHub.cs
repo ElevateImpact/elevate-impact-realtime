@@ -17,6 +17,15 @@ public class ElevateHub : Hub<IElevateHubClient>
     private static readonly Dictionary<string, CancellationTokenSource> _disconnectTimers = new();
     private static readonly object _timerLock = new();
 
+    // Disconnect grace period — window during which a reconnect cancels the
+    // pending offline broadcast. Tightened from 15s to 5s default to reduce
+    // the false-positive "online" window after a user closes their tab; env
+    // var lets ops bump it back up if reconnect storms become a problem.
+    private static readonly int _disconnectGraceSeconds =
+        int.TryParse(Environment.GetEnvironmentVariable("PRESENCE_DISCONNECT_GRACE_SECONDS"), out var s) && s > 0
+            ? s
+            : 5;
+
     public ElevateHub(NpgsqlDataSource db, PresenceTracker presenceTracker, ILogger<ElevateHub> logger)
     {
         _db = db;
@@ -78,7 +87,8 @@ public class ElevateHub : Hub<IElevateHubClient>
 
             if (hasNoConnections)
             {
-                // Start 15-second grace period before broadcasting offline
+                // Start grace period before broadcasting offline. Configurable
+                // via PRESENCE_DISCONNECT_GRACE_SECONDS env var (default 5s).
                 var cts = new CancellationTokenSource();
                 SetDisconnectTimer(userId, cts);
 
@@ -86,7 +96,7 @@ public class ElevateHub : Hub<IElevateHubClient>
                 {
                     try
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(15), cts.Token);
+                        await Task.Delay(TimeSpan.FromSeconds(_disconnectGraceSeconds), cts.Token);
 
                         // After grace period, check if still offline
                         if (!_presenceTracker.IsOnline(userId))
@@ -161,9 +171,71 @@ public class ElevateHub : Hub<IElevateHubClient>
             new { userId, conversationKey, messageId, readAt = DateTime.UtcNow });
     }
 
-    public string[] GetOnlineUsers(string[] userIds)
+    /// <summary>
+    /// Returns the online status of the OTHER participant in each conversation
+    /// the caller passes. The result is a list of {userId, isOnline} pairs.
+    ///
+    /// Scoping (security): each conversation key is validated against the
+    /// database — the caller must be a participant in EVERY key they pass, or
+    /// that key is silently dropped from the result. Prevents arbitrary
+    /// presence lookups; the caller can only see online status for users they
+    /// already have a conversation with.
+    ///
+    /// Called from the client on reconnect and on JoinConversation to
+    /// reconcile presence state with the hub (which is the source of truth).
+    /// </summary>
+    public async Task<object[]> GetConversationPresence(string[] conversationKeys)
     {
-        return _presenceTracker.GetOnlineUsers(userIds);
+        var userId = GetUserId();
+        if (string.IsNullOrEmpty(userId) || conversationKeys == null || conversationKeys.Length == 0)
+            return Array.Empty<object>();
+
+        // Step 1: parse + structurally filter (caller must be in key).
+        var candidatePartnerIds = new List<string>(conversationKeys.Length);
+        foreach (var key in conversationKeys)
+        {
+            if (string.IsNullOrEmpty(key)) continue;
+            var parts = key.Split('-', 2);
+            if (parts.Length != 2 || string.IsNullOrEmpty(parts[0]) || string.IsNullOrEmpty(parts[1]))
+                continue;
+            if (parts[0] != userId && parts[1] != userId)
+                continue; // caller not in this conversation — silent drop
+            var partnerId = parts[0] == userId ? parts[1] : parts[0];
+            candidatePartnerIds.Add(partnerId);
+        }
+
+        if (candidatePartnerIds.Count == 0)
+            return Array.Empty<object>();
+
+        // Step 2: DB-verify each candidate partner actually has a Chat with
+        // the caller. Defense in depth — the key format check above already
+        // requires the caller's id, but a real Chat row is the ground truth.
+        await using var conn = await _db.OpenConnectionAsync();
+        var verifiedPartners = await conn.QueryAsync<string>(@"
+            SELECT DISTINCT CASE
+                WHEN ""fromId"" = @UserId THEN ""toId""
+                ELSE ""fromId""
+            END AS partner_id
+            FROM ""Chat""
+            WHERE (""fromId"" = @UserId OR ""toId"" = @UserId)
+              AND (""fromId"" = ANY(@PartnerIds) OR ""toId"" = ANY(@PartnerIds))
+              AND ""fromId"" IS NOT NULL
+              AND ""toId"" IS NOT NULL",
+            new { UserId = userId, PartnerIds = candidatePartnerIds.ToArray() });
+
+        var verifiedSet = new HashSet<string>(verifiedPartners);
+
+        // Step 3: build presence pairs for verified partners only.
+        var result = new List<object>(verifiedSet.Count);
+        foreach (var partnerId in verifiedSet)
+        {
+            result.Add(new
+            {
+                userId = partnerId,
+                isOnline = _presenceTracker.IsOnline(partnerId),
+            });
+        }
+        return result.ToArray();
     }
 
     private string? GetUserId()
