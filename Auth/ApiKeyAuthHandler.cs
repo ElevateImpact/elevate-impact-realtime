@@ -23,9 +23,20 @@ public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptio
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
-        // Try query parameter first, then header
-        var apiKey = Request.Query["apiKey"].FirstOrDefault()
-                     ?? Request.Headers["X-Api-Key"].FirstOrDefault();
+        // Preferred: Authorization: Bearer <key> (SignalR JS client's
+        // accessTokenFactory routes through this header). Fall back to the
+        // legacy X-Api-Key header and ?apiKey= query param so staggered
+        // deploys + the server-to-server /api/notify path keep working.
+        var authHeader = Request.Headers["Authorization"].FirstOrDefault();
+        string? apiKey = null;
+        if (!string.IsNullOrEmpty(authHeader) &&
+            authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            apiKey = authHeader.Substring("Bearer ".Length).Trim();
+        }
+
+        apiKey ??= Request.Headers["X-Api-Key"].FirstOrDefault()
+                   ?? Request.Query["apiKey"].FirstOrDefault();
 
         if (string.IsNullOrEmpty(apiKey))
             return Task.FromResult(AuthenticateResult.Fail("API key is required"));
