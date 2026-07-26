@@ -35,7 +35,19 @@ public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptio
             apiKey = authHeader.Substring("Bearer ".Length).Trim();
         }
 
+        // `access_token` is NOT optional to support. WebSockets and
+        // Server-Sent Events cannot set request headers, so for those two
+        // transports the SignalR JS client puts accessTokenFactory's value in
+        // the query string under exactly this name. Only the negotiate POST can
+        // send the Bearer header.
+        //
+        // Without it the handshake half-works in a way that is hard to read:
+        // negotiate returns 200, then every transport 401s, and the client
+        // surfaces the generic "connection could not be found on the server …
+        // check that sticky sessions are enabled" — which sends you looking for
+        // a scaling problem that isn't there (the hub runs a single replica).
         apiKey ??= Request.Headers["X-Api-Key"].FirstOrDefault()
+                   ?? Request.Query["access_token"].FirstOrDefault()
                    ?? Request.Query["apiKey"].FirstOrDefault();
 
         if (string.IsNullOrEmpty(apiKey))
