@@ -129,6 +129,15 @@ app.MapPost("/api/notify", async (
             await hubContext.Clients.Group(request.Group).ConversationUpdated(request.Payload!);
             break;
 
+        case "AttachmentStatusChanged":
+            await hubContext.Clients.Group(request.Group).AttachmentStatusChanged(request.Payload!);
+            if (request.UserGroups != null)
+            {
+                foreach (var userGroup in request.UserGroups)
+                    await hubContext.Clients.Group($"user:{userGroup}").AttachmentStatusChanged(request.Payload!);
+            }
+            break;
+
         case "SamThinkingStarted":
             await hubContext.Clients.Group(request.Group).SamThinkingStarted(request.Payload!);
             break;

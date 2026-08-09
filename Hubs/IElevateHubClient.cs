@@ -6,6 +6,7 @@ public interface IElevateHubClient
     Task MessageDeleted(object payload);
     Task ReadReceiptReceived(object payload);
     Task ConversationUpdated(object payload);
+    Task AttachmentStatusChanged(object payload);
     Task TypingIndicatorReceived(object payload);
     Task UserPresenceChanged(object payload);
     Task SamThinkingStarted(object payload);
