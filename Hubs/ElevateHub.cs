@@ -156,7 +156,7 @@ public class ElevateHub : Hub<IElevateHubClient>
     public async Task SendTypingIndicator(string conversationKey, bool isTyping)
     {
         var userId = GetUserId();
-        if (string.IsNullOrEmpty(userId)) return;
+        if (string.IsNullOrEmpty(userId) || !IsParticipant(conversationKey, userId)) return;
 
         await Clients.OthersInGroup($"conversation:{conversationKey}").TypingIndicatorReceived(
             new { userId, conversationKey, isTyping });
@@ -165,7 +165,7 @@ public class ElevateHub : Hub<IElevateHubClient>
     public async Task MarkAsRead(string conversationKey, string messageId)
     {
         var userId = GetUserId();
-        if (string.IsNullOrEmpty(userId)) return;
+        if (string.IsNullOrEmpty(userId) || !IsParticipant(conversationKey, userId)) return;
 
         await Clients.Group($"conversation:{conversationKey}").ReadReceiptReceived(
             new { userId, conversationKey, messageId, readAt = DateTime.UtcNow });
@@ -238,11 +238,18 @@ public class ElevateHub : Hub<IElevateHubClient>
         return result.ToArray();
     }
 
-    private string? GetUserId()
+    /// <summary>Key is "{id1}-{id2}" and contains userId. Consistency check only: userId is self-asserted until H-4b, so this is NOT an authorization boundary. See AGENTS.md §H-4b.</summary>
+    public static bool IsParticipant(string? conversationKey, string userId)
     {
-        return Context.User?.FindFirst("userId")?.Value
-               ?? Context.GetHttpContext()?.Request.Query["userId"].FirstOrDefault();
+        if (string.IsNullOrEmpty(conversationKey)) return false;
+        var parts = conversationKey.Split('-', 2);
+        return parts.Length == 2
+               && !string.IsNullOrEmpty(parts[0]) && !string.IsNullOrEmpty(parts[1])
+               && (parts[0] == userId || parts[1] == userId);
     }
+
+    /// <summary>Single source of hub identity: the auth handler's userId claim (H-4b swaps it to a signed token).</summary>
+    private string? GetUserId() => Context.User?.FindFirst("userId")?.Value;
 
     private static async Task<string[]> GetConversationPartnerIds(NpgsqlConnection conn, string userId)
     {

@@ -15,8 +15,8 @@ DotNetEnv.Env.TraversePath().Load();
 // Environment variables
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL")
     ?? throw new InvalidOperationException("DATABASE_URL is required");
-var signalrApiKey = Environment.GetEnvironmentVariable("SIGNALR_API_KEY")
-    ?? throw new InvalidOperationException("SIGNALR_API_KEY is required");
+// Public browser key + server-only notify key; refuses to boot on an unsafe pair. See AGENTS.md §H-4a.
+var realtimeKeys = RealtimeKeys.FromEnvironment(Environment.GetEnvironmentVariable);
 var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS")
     ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? Array.Empty<string>();
@@ -42,7 +42,7 @@ builder.Services.AddSignalR();
 builder.Services.AddSingleton<PresenceTracker>();
 
 // API key config
-builder.Services.AddSingleton(new ApiKeyConfig(signalrApiKey));
+builder.Services.AddSingleton(realtimeKeys);
 
 // Authentication
 builder.Services.AddAuthentication("ApiKey")
@@ -63,6 +63,11 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// Warning until enforced, so an unfinished rollout stays visible at every boot.
+app.Logger.Log(realtimeKeys.AcceptsPublicKeyOnNotify ? LogLevel.Warning : LogLevel.Information,
+    "H4_NOTIFY_AUTH_MODE={Mode} (public key accepted on /api/notify: {AcceptsPublic})",
+    realtimeKeys.Mode, realtimeKeys.AcceptsPublicKeyOnNotify);
 
 app.UseCors();
 app.UseAuthentication();
@@ -86,21 +91,9 @@ app.MapGet("/api/health", async (Npgsql.NpgsqlDataSource db, ILogger<Program> lo
     }
 });
 
-// Notify endpoint (server-to-server, API key protected)
-app.MapPost("/api/notify", async (
-    NotifyRequest request,
-    IHubContext<ElevateHub, IElevateHubClient> hubContext,
-    ApiKeyConfig apiKeyConfig,
-    HttpContext httpContext) =>
+// Notify endpoint (server-to-server); key check + validation live in NotifyEndpoint. See AGENTS.md §H-4a.
+app.MapNotifyEndpoint(async (request, hubContext) =>
 {
-    // Validate API key from header
-    var apiKey = httpContext.Request.Headers["X-Api-Key"].FirstOrDefault();
-    if (string.IsNullOrEmpty(apiKey) || apiKey != apiKeyConfig.Key)
-        return Results.Unauthorized();
-
-    if (string.IsNullOrEmpty(request.EventType) || string.IsNullOrEmpty(request.Group))
-        return Results.BadRequest(new { error = "eventType and group are required" });
-
     switch (request.EventType)
     {
         case "MessageReceived":

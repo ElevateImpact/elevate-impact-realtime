@@ -5,28 +5,26 @@ using Microsoft.Extensions.Options;
 
 namespace ElevateRealtime.Auth;
 
-public record ApiKeyConfig(string Key);
-
+/// <summary>Hub auth: the PUBLIC browser key only (never the server key); userId is self-asserted until §H-4b. See AGENTS.md.</summary>
 public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
 {
-    private readonly ApiKeyConfig _apiKeyConfig;
+    private readonly RealtimeKeys _keys;
 
     public ApiKeyAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
         ILoggerFactory logger,
         UrlEncoder encoder,
-        ApiKeyConfig apiKeyConfig)
+        RealtimeKeys keys)
         : base(options, logger, encoder)
     {
-        _apiKeyConfig = apiKeyConfig;
+        _keys = keys;
     }
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
         // Preferred: Authorization: Bearer <key> (SignalR JS client's
         // accessTokenFactory routes through this header). Fall back to the
-        // legacy X-Api-Key header and ?apiKey= query param so staggered
-        // deploys + the server-to-server /api/notify path keep working.
+        // legacy X-Api-Key header and ?apiKey= query param for older clients.
         var authHeader = Request.Headers["Authorization"].FirstOrDefault();
         string? apiKey = null;
         if (!string.IsNullOrEmpty(authHeader) &&
@@ -53,9 +51,10 @@ public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptio
         if (string.IsNullOrEmpty(apiKey))
             return Task.FromResult(AuthenticateResult.Fail("API key is required"));
 
-        if (apiKey != _apiKeyConfig.Key)
+        if (!_keys.IsPublicKey(apiKey))
             return Task.FromResult(AuthenticateResult.Fail("Invalid API key"));
 
+        // Self-asserted: anyone with the public key can claim any userId. Open item H-4b (AGENTS.md).
         var userId = Request.Query["userId"].FirstOrDefault();
 
         var claims = new List<Claim>
