@@ -1,4 +1,5 @@
 using Dapper;
+using ElevateRealtime.Auth;
 using ElevateRealtime.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
@@ -12,6 +13,7 @@ public class ElevateHub : Hub<IElevateHubClient>
     private readonly NpgsqlDataSource _db;
     private readonly PresenceTracker _presenceTracker;
     private readonly ILogger<ElevateHub> _logger;
+    private readonly HubIdentityKeys _identity;
 
     // Grace period timers for presence (keyed by userId)
     private static readonly Dictionary<string, CancellationTokenSource> _disconnectTimers = new();
@@ -26,11 +28,13 @@ public class ElevateHub : Hub<IElevateHubClient>
             ? s
             : 5;
 
-    public ElevateHub(NpgsqlDataSource db, PresenceTracker presenceTracker, ILogger<ElevateHub> logger)
+    public ElevateHub(NpgsqlDataSource db, PresenceTracker presenceTracker, ILogger<ElevateHub> logger,
+        HubIdentityKeys identity)
     {
         _db = db;
         _presenceTracker = presenceTracker;
         _logger = logger;
+        _identity = identity;
     }
 
     public override async Task OnConnectedAsync()
@@ -40,6 +44,8 @@ public class ElevateHub : Hub<IElevateHubClient>
         {
             throw new HubException("userId is required");
         }
+
+        _identity.LogConnection(Context.User, _logger);
 
         // Validate user exists in database
         await using var conn = await _db.OpenConnectionAsync();
@@ -238,7 +244,7 @@ public class ElevateHub : Hub<IElevateHubClient>
         return result.ToArray();
     }
 
-    /// <summary>Key is "{id1}-{id2}" and contains userId. Consistency check only: userId is self-asserted until H-4b, so this is NOT an authorization boundary. See AGENTS.md §H-4b.</summary>
+    /// <summary>Key is "{id1}-{id2}" and contains userId. An authorization boundary only for token-verified identities (enforced mode). See AGENTS.md §H-14.</summary>
     public static bool IsParticipant(string? conversationKey, string userId)
     {
         if (string.IsNullOrEmpty(conversationKey)) return false;
@@ -248,7 +254,7 @@ public class ElevateHub : Hub<IElevateHubClient>
                && (parts[0] == userId || parts[1] == userId);
     }
 
-    /// <summary>Single source of hub identity: the auth handler's userId claim (H-4b swaps it to a signed token).</summary>
+    /// <summary>Single source of hub identity: the auth handler's userId claim (the verified token sub on the token path). See AGENTS.md §H-14.</summary>
     private string? GetUserId() => Context.User?.FindFirst("userId")?.Value;
 
     private static async Task<string[]> GetConversationPartnerIds(NpgsqlConnection conn, string userId)

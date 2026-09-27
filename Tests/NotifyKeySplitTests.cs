@@ -202,7 +202,7 @@ public class NotifyKeySplitTests
         }));
     }
 
-    // ---- hub: consistency check only (userId is self-asserted until H-4b) ----
+    // ---- hub: key must contain the caller id (an authorization boundary once H-14 is enforced) ----
 
     [Theory]
     [InlineData("alice-bob", "alice", true)]

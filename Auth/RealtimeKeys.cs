@@ -87,6 +87,16 @@ public sealed class RealtimeKeys
                && CryptographicOperations.FixedTimeEquals(Hash(presented), _publicKeyHash);
     }
 
+    /// <summary>True when <paramref name="candidate"/> equals the public or the server key (H-14 boot distinctness check).</summary>
+    public bool MatchesPublicOrServerKey(string? candidate)
+    {
+        candidate = candidate?.Trim();
+        if (string.IsNullOrEmpty(candidate)) return false;
+        var hash = Hash(candidate);
+        return CryptographicOperations.FixedTimeEquals(hash, _publicKeyHash)
+               || (_serverKeyHash is not null && CryptographicOperations.FixedTimeEquals(hash, _serverKeyHash));
+    }
+
     public NotifyAuthorization AuthorizeNotify(string? presented)
     {
         presented = presented?.Trim();

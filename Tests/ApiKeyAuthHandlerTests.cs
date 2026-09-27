@@ -30,7 +30,8 @@ public class ApiKeyAuthHandlerTests
             new OptionsMonitorStub(),
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
-            keys);
+            keys,
+            new HubIdentityKeys(null, false, keys));
 
         var context = new DefaultHttpContext();
         configure(context);
