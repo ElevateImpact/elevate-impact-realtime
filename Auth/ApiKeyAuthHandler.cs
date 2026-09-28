@@ -5,28 +5,29 @@ using Microsoft.Extensions.Options;
 
 namespace ElevateRealtime.Auth;
 
-public record ApiKeyConfig(string Key);
-
+/// <summary>Hub auth: a verified hub token, or (legacy/transition only) the public key + self-asserted ?userId=. See AGENTS.md §H-14.</summary>
 public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
 {
-    private readonly ApiKeyConfig _apiKeyConfig;
+    private readonly RealtimeKeys _keys;
+    private readonly HubIdentityKeys _identity;
 
     public ApiKeyAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
         ILoggerFactory logger,
         UrlEncoder encoder,
-        ApiKeyConfig apiKeyConfig)
+        RealtimeKeys keys,
+        HubIdentityKeys identity)
         : base(options, logger, encoder)
     {
-        _apiKeyConfig = apiKeyConfig;
+        _keys = keys;
+        _identity = identity;
     }
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
         // Preferred: Authorization: Bearer <key> (SignalR JS client's
         // accessTokenFactory routes through this header). Fall back to the
-        // legacy X-Api-Key header and ?apiKey= query param so staggered
-        // deploys + the server-to-server /api/notify path keep working.
+        // legacy X-Api-Key header and ?apiKey= query param for older clients.
         var authHeader = Request.Headers["Authorization"].FirstOrDefault();
         string? apiKey = null;
         if (!string.IsNullOrEmpty(authHeader) &&
@@ -53,23 +54,54 @@ public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptio
         if (string.IsNullOrEmpty(apiKey))
             return Task.FromResult(AuthenticateResult.Fail("API key is required"));
 
-        if (apiKey != _apiKeyConfig.Key)
-            return Task.FromResult(AuthenticateResult.Fail("Invalid API key"));
+        // Same credential slot carries either the public key (legacy wire) or a hub token (H-14 wire).
+        if (_keys.IsPublicKey(apiKey))
+        {
+            if (!_identity.AcceptsAssertedUserId)
+                return Task.FromResult(Refuse("public-key", "hub token required"));
+            // Self-asserted: anyone with the public key can claim any userId. Closed by enforced mode (AGENTS.md §H-14).
+            return Task.FromResult(Success(Request.Query["userId"].FirstOrDefault(),
+                HubIdentityKeys.MethodAssertedUserId));
+        }
 
-        var userId = Request.Query["userId"].FirstOrDefault();
+        if (_identity.Tokens is { } tokens)
+        {
+            var verified = tokens.Verify(apiKey, DateTimeOffset.UtcNow);
+            // Identity comes from the token only; ?userId= is ignored on this path.
+            // The ticket expires with the token, so CloseOnAuthenticationExpiration ends the connection then (HubEndpoint).
+            if (verified.Succeeded)
+                return Task.FromResult(Success(verified.UserId,
+                    verified.ViaPreviousKey ? HubIdentityKeys.MethodHubTokenPreviousKey : HubIdentityKeys.MethodHubToken,
+                    DateTimeOffset.FromUnixTimeSeconds(verified.ExpiresAt)));
+            if (LooksLikeToken(apiKey))
+                return Task.FromResult(Refuse("invalid-token", verified.Failure!));
+        }
 
+        return Task.FromResult(Refuse("unknown", "Invalid API key"));
+    }
+
+    /// <summary>A null <paramref name="expiresUtc"/> (asserted path) leaves the connection unbounded, as before H-14.</summary>
+    private AuthenticateResult Success(string? userId, string method, DateTimeOffset? expiresUtc = null)
+    {
         var claims = new List<Claim>
         {
             new(ClaimTypes.Authentication, "ApiKey"),
+            new(ClaimTypes.AuthenticationMethod, method),
         };
-
         if (!string.IsNullOrEmpty(userId))
             claims.Add(new Claim("userId", userId));
 
-        var identity = new ClaimsIdentity(claims, Scheme.Name);
-        var principal = new ClaimsPrincipal(identity);
-        var ticket = new AuthenticationTicket(principal, Scheme.Name);
-
-        return Task.FromResult(AuthenticateResult.Success(ticket));
+        var principal = new ClaimsPrincipal(new ClaimsIdentity(claims, Scheme.Name));
+        var properties = new AuthenticationProperties { ExpiresUtc = expiresUtc };
+        return AuthenticateResult.Success(new AuthenticationTicket(principal, properties, Scheme.Name));
     }
+
+    private AuthenticateResult Refuse(string credentialKind, string reason)
+    {
+        Logger.LogWarning("Hub connect refused (mode {Mode}, credential {Credential}, reason {Reason})",
+            _identity.Mode, credentialKind, reason);
+        return AuthenticateResult.Fail(reason);
+    }
+
+    private static bool LooksLikeToken(string credential) => credential.Count(c => c == '.') == 1;
 }

@@ -15,8 +15,10 @@ DotNetEnv.Env.TraversePath().Load();
 // Environment variables
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL")
     ?? throw new InvalidOperationException("DATABASE_URL is required");
-var signalrApiKey = Environment.GetEnvironmentVariable("SIGNALR_API_KEY")
-    ?? throw new InvalidOperationException("SIGNALR_API_KEY is required");
+// Public browser key + server-only notify key; refuses to boot on an unsafe pair. See AGENTS.md §H-4a.
+var realtimeKeys = RealtimeKeys.FromEnvironment(Environment.GetEnvironmentVariable);
+// Hub identity: signed token vs self-asserted ?userId=; refuses to boot on an unsafe combination. See AGENTS.md §H-14.
+var hubIdentity = HubIdentityKeys.FromEnvironment(Environment.GetEnvironmentVariable, realtimeKeys);
 var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS")
     ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? Array.Empty<string>();
@@ -30,10 +32,9 @@ var dataSourceBuilder = new Npgsql.NpgsqlDataSourceBuilder(connectionString);
 var dataSource = dataSourceBuilder.Build();
 builder.Services.AddSingleton(dataSource);
 
-// Serilog
-builder.Host.UseSerilog((ctx, lc) => lc
-    .WriteTo.Console()
-    .MinimumLevel.Information());
+// Serilog; levels + access_token redaction live in CredentialLogSafety (AGENTS.md §H-14 logging).
+builder.Host.UseSerilog((ctx, lc) => CredentialLogSafety.Configure(lc)
+    .WriteTo.Console());
 
 // SignalR
 builder.Services.AddSignalR();
@@ -42,7 +43,8 @@ builder.Services.AddSignalR();
 builder.Services.AddSingleton<PresenceTracker>();
 
 // API key config
-builder.Services.AddSingleton(new ApiKeyConfig(signalrApiKey));
+builder.Services.AddSingleton(realtimeKeys);
+builder.Services.AddSingleton(hubIdentity);
 
 // Authentication
 builder.Services.AddAuthentication("ApiKey")
@@ -63,6 +65,17 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// Warning until enforced, so an unfinished rollout stays visible at every boot.
+app.Logger.Log(realtimeKeys.AcceptsPublicKeyOnNotify ? LogLevel.Warning : LogLevel.Information,
+    "H4_NOTIFY_AUTH_MODE={Mode} (public key accepted on /api/notify: {AcceptsPublic})",
+    realtimeKeys.Mode, realtimeKeys.AcceptsPublicKeyOnNotify);
+app.Logger.Log(hubIdentity.AcceptsAssertedUserId ? LogLevel.Warning : LogLevel.Information,
+    "H14_HUB_IDENTITY_MODE={Mode} (self-asserted ?userId= accepted on the hub: {AcceptsAsserted})",
+    hubIdentity.Mode, hubIdentity.AcceptsAssertedUserId);
+if (hubIdentity.RotationInProgress)
+    app.Logger.LogWarning("H14_HUB_TOKEN_ROTATION: {Variable} is set; delete it once {Token} stops appearing",
+        HubIdentityKeys.PreviousTokenKeyVariable, HubIdentityKeys.PreviousKeyToken);
 
 app.UseCors();
 app.UseAuthentication();
@@ -86,21 +99,9 @@ app.MapGet("/api/health", async (Npgsql.NpgsqlDataSource db, ILogger<Program> lo
     }
 });
 
-// Notify endpoint (server-to-server, API key protected)
-app.MapPost("/api/notify", async (
-    NotifyRequest request,
-    IHubContext<ElevateHub, IElevateHubClient> hubContext,
-    ApiKeyConfig apiKeyConfig,
-    HttpContext httpContext) =>
+// Notify endpoint (server-to-server); key check + validation live in NotifyEndpoint. See AGENTS.md §H-4a.
+app.MapNotifyEndpoint(async (request, hubContext) =>
 {
-    // Validate API key from header
-    var apiKey = httpContext.Request.Headers["X-Api-Key"].FirstOrDefault();
-    if (string.IsNullOrEmpty(apiKey) || apiKey != apiKeyConfig.Key)
-        return Results.Unauthorized();
-
-    if (string.IsNullOrEmpty(request.EventType) || string.IsNullOrEmpty(request.Group))
-        return Results.BadRequest(new { error = "eventType and group are required" });
-
     switch (request.EventType)
     {
         case "MessageReceived":
@@ -153,7 +154,7 @@ app.MapPost("/api/notify", async (
     return Results.Ok(new { success = true });
 });
 
-// Map SignalR hub
-app.MapHub<ElevateHub>("/hubs/elevate");
+// Map SignalR hub; token connections close at token expiry. See AGENTS.md §H-14 connection lifetime.
+app.MapElevateHub();
 
 app.Run($"http://0.0.0.0:{port}");
