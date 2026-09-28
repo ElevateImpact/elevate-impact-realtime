@@ -18,15 +18,20 @@ namespace ElevateRealtime.Tests;
 public class ApiKeyAuthHandlerTests
 {
     private const string Key = "test-key-value";
+    private const string ServerKey = "server-only-key-0123456789abcdefghijklmnop";
+
+    private static Task<AuthenticateResult> AuthenticateAsync(Action<HttpContext> configure)
+        => AuthenticateAsync(configure, new RealtimeKeys(Key, null, false));
 
     private static async Task<AuthenticateResult> AuthenticateAsync(
-        Action<HttpContext> configure)
+        Action<HttpContext> configure, RealtimeKeys keys)
     {
         var handler = new ApiKeyAuthHandler(
             new OptionsMonitorStub(),
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
-            new ApiKeyConfig(Key));
+            keys,
+            new HubIdentityKeys(null, false, keys));
 
         var context = new DefaultHttpContext();
         configure(context);
@@ -100,6 +105,58 @@ public class ApiKeyAuthHandlerTests
 
         Assert.True(result.Succeeded);
         Assert.Equal("user-123", result.Principal!.FindFirst("userId")?.Value);
+    }
+
+    /// <summary>H-4 end state: the public key still opens the hub (browsers keep working).</summary>
+    [Fact]
+    public async Task PublicKey_ConnectsToHub_InEnforcedMode()
+    {
+        var result = await AuthenticateAsync(
+            ctx => ctx.Request.QueryString = new QueryString($"?access_token={Key}&userId=u1"),
+            new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify: false));
+        Assert.True(result.Succeeded);
+    }
+
+    /// <summary>H-4: the server key is a notify credential, never a hub credential, on any carrier or mode.</summary>
+    [Theory]
+    [InlineData("bearer", true)]
+    [InlineData("x-api-key", true)]
+    [InlineData("access_token", true)]
+    [InlineData("apiKey", true)]
+    [InlineData("bearer", false)]
+    [InlineData("x-api-key", false)]
+    [InlineData("access_token", false)]
+    [InlineData("apiKey", false)]
+    public async Task ServerKey_IsRefusedOnHub(string carrier, bool acceptPublicKeyOnNotify)
+    {
+        var keys = new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify);
+        var result = await AuthenticateAsync(ctx => Present(ctx, carrier, ServerKey), keys);
+        Assert.False(result.Succeeded);
+    }
+
+    /// <summary>Control for the theory above: the same carriers accept the public key.</summary>
+    [Theory]
+    [InlineData("bearer")]
+    [InlineData("x-api-key")]
+    [InlineData("access_token")]
+    [InlineData("apiKey")]
+    public async Task PublicKey_IsAcceptedOnHub_OnEveryCarrier_InEnforcedMode(string carrier)
+    {
+        var keys = new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify: false);
+        var result = await AuthenticateAsync(ctx => Present(ctx, carrier, Key), keys);
+        Assert.True(result.Succeeded);
+    }
+
+    private static void Present(HttpContext context, string carrier, string credential)
+    {
+        switch (carrier)
+        {
+            case "bearer": context.Request.Headers["Authorization"] = $"Bearer {credential}"; break;
+            case "x-api-key": context.Request.Headers["X-Api-Key"] = credential; break;
+            case "access_token": context.Request.QueryString = new QueryString($"?access_token={credential}"); break;
+            case "apiKey": context.Request.QueryString = new QueryString($"?apiKey={credential}"); break;
+            default: throw new ArgumentOutOfRangeException(nameof(carrier), carrier, null);
+        }
     }
 
     private sealed class OptionsMonitorStub : IOptionsMonitor<AuthenticationSchemeOptions>

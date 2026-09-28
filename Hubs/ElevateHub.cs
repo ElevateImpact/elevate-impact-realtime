@@ -1,4 +1,5 @@
 using Dapper;
+using ElevateRealtime.Auth;
 using ElevateRealtime.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
@@ -12,6 +13,7 @@ public class ElevateHub : Hub<IElevateHubClient>
     private readonly NpgsqlDataSource _db;
     private readonly PresenceTracker _presenceTracker;
     private readonly ILogger<ElevateHub> _logger;
+    private readonly HubIdentityKeys _identity;
 
     // Grace period timers for presence (keyed by userId)
     private static readonly Dictionary<string, CancellationTokenSource> _disconnectTimers = new();
@@ -26,11 +28,13 @@ public class ElevateHub : Hub<IElevateHubClient>
             ? s
             : 5;
 
-    public ElevateHub(NpgsqlDataSource db, PresenceTracker presenceTracker, ILogger<ElevateHub> logger)
+    public ElevateHub(NpgsqlDataSource db, PresenceTracker presenceTracker, ILogger<ElevateHub> logger,
+        HubIdentityKeys identity)
     {
         _db = db;
         _presenceTracker = presenceTracker;
         _logger = logger;
+        _identity = identity;
     }
 
     public override async Task OnConnectedAsync()
@@ -40,6 +44,8 @@ public class ElevateHub : Hub<IElevateHubClient>
         {
             throw new HubException("userId is required");
         }
+
+        _identity.LogConnection(Context.User, _logger);
 
         // Validate user exists in database
         await using var conn = await _db.OpenConnectionAsync();
@@ -156,7 +162,7 @@ public class ElevateHub : Hub<IElevateHubClient>
     public async Task SendTypingIndicator(string conversationKey, bool isTyping)
     {
         var userId = GetUserId();
-        if (string.IsNullOrEmpty(userId)) return;
+        if (string.IsNullOrEmpty(userId) || !IsParticipant(conversationKey, userId)) return;
 
         await Clients.OthersInGroup($"conversation:{conversationKey}").TypingIndicatorReceived(
             new { userId, conversationKey, isTyping });
@@ -165,7 +171,7 @@ public class ElevateHub : Hub<IElevateHubClient>
     public async Task MarkAsRead(string conversationKey, string messageId)
     {
         var userId = GetUserId();
-        if (string.IsNullOrEmpty(userId)) return;
+        if (string.IsNullOrEmpty(userId) || !IsParticipant(conversationKey, userId)) return;
 
         await Clients.Group($"conversation:{conversationKey}").ReadReceiptReceived(
             new { userId, conversationKey, messageId, readAt = DateTime.UtcNow });
@@ -238,11 +244,18 @@ public class ElevateHub : Hub<IElevateHubClient>
         return result.ToArray();
     }
 
-    private string? GetUserId()
+    /// <summary>Key is "{id1}-{id2}" and contains userId. An authorization boundary only for token-verified identities (enforced mode). See AGENTS.md §H-14.</summary>
+    public static bool IsParticipant(string? conversationKey, string userId)
     {
-        return Context.User?.FindFirst("userId")?.Value
-               ?? Context.GetHttpContext()?.Request.Query["userId"].FirstOrDefault();
+        if (string.IsNullOrEmpty(conversationKey)) return false;
+        var parts = conversationKey.Split('-', 2);
+        return parts.Length == 2
+               && !string.IsNullOrEmpty(parts[0]) && !string.IsNullOrEmpty(parts[1])
+               && (parts[0] == userId || parts[1] == userId);
     }
+
+    /// <summary>Single source of hub identity: the auth handler's userId claim (the verified token sub on the token path). See AGENTS.md §H-14.</summary>
+    private string? GetUserId() => Context.User?.FindFirst("userId")?.Value;
 
     private static async Task<string[]> GetConversationPartnerIds(NpgsqlConnection conn, string userId)
     {
