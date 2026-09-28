@@ -2,6 +2,7 @@ using System.Text.Encodings.Web;
 using ElevateRealtime.Auth;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -147,6 +148,80 @@ public class ApiKeyAuthHandlerTests
         Assert.True(result.Succeeded);
     }
 
+    // ---- /api/notify belongs to NotifyAuth (AGENTS.md §notify-auth-noise) ----
+
+    private const string HubKey = "hub-token-key-0123456789abcdefghijklmnopqr";
+
+    private static async Task<(AuthenticateResult result, CapturingLoggerProvider log)> AuthenticateLogged(
+        string path, HubIdentityKeys identity, RealtimeKeys keys, Action<HttpContext> configure)
+    {
+        var log = new CapturingLoggerProvider();
+        var handler = new ApiKeyAuthHandler(new OptionsMonitorStub(), new LoggerFactory(new[] { log }),
+            UrlEncoder.Default, keys, identity);
+        var context = new DefaultHttpContext();
+        context.Request.Path = path;
+        configure(context);
+        await handler.InitializeAsync(new AuthenticationScheme("ApiKey", null, typeof(ApiKeyAuthHandler)), context);
+        return (await handler.AuthenticateAsync(), log);
+    }
+
+    private static IEnumerable<(string Mode, HubIdentityKeys Identity, RealtimeKeys Keys)> AllModes()
+    {
+        var keys = new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify: true);
+        yield return ("legacy", new HubIdentityKeys(null, false, keys), keys);
+        yield return ("transition", new HubIdentityKeys(HubKey, true, keys), keys);
+        yield return ("enforced", new HubIdentityKeys(HubKey, false, keys), keys);
+    }
+
+    /// <summary>The soak noise: the server key on /api/notify used to log a hub refusal on every notify.</summary>
+    [Theory]
+    [InlineData("/api/notify")]
+    [InlineData("/API/Notify")]
+    [InlineData("/api/notify/")]
+    public async Task NotifyRequest_IsNotJudgedOrLoggedByTheHubScheme(string path)
+    {
+        foreach (var (mode, identity, keys) in AllModes())
+        {
+            foreach (var credential in new[] { ServerKey, "wrong-notify-key", Key })
+            {
+                var (result, log) = await AuthenticateLogged(path, identity, keys,
+                    ctx => ctx.Request.Headers["X-Api-Key"] = credential);
+                Assert.True(result.None, $"{mode} {path}");
+                Assert.DoesNotContain(log.Entries, e => e.Message.Contains("Hub connect refused"));
+            }
+        }
+    }
+
+    /// <summary>Control: the skip is exactly /api/notify, so a hub connect with an unknown key still logs its refusal.</summary>
+    [Theory]
+    [InlineData("/hubs/elevate")]
+    [InlineData("/hubs/elevate/negotiate")]
+    [InlineData("/api/notifyall")]
+    public async Task HubRequest_WithUnknownKey_StillLogsTheRefusal(string path)
+    {
+        foreach (var (mode, identity, keys) in AllModes())
+        {
+            var (result, log) = await AuthenticateLogged(path, identity, keys,
+                ctx => ctx.Request.QueryString = new QueryString("?access_token=not-a-known-key"));
+            Assert.False(result.Succeeded, mode);
+            Assert.False(result.None, mode);
+            Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+                && e.Message.Contains("Hub connect refused") && e.Message.Contains("credential unknown"));
+        }
+    }
+
+    /// <summary>Hub auth is untouched on the hub path: the public key still connects in legacy and transition.</summary>
+    [Fact]
+    public async Task HubPath_PublicKey_StillAuthenticates()
+    {
+        foreach (var (mode, identity, keys) in AllModes().Where(m => m.Mode != "enforced"))
+        {
+            var (result, _) = await AuthenticateLogged("/hubs/elevate", identity, keys,
+                ctx => ctx.Request.QueryString = new QueryString($"?access_token={Key}&userId=u1"));
+            Assert.True(result.Succeeded, mode);
+        }
+    }
+
     private static void Present(HttpContext context, string carrier, string credential)
     {
         switch (carrier)
@@ -164,5 +239,19 @@ public class ApiKeyAuthHandlerTests
         public AuthenticationSchemeOptions CurrentValue { get; } = new();
         public AuthenticationSchemeOptions Get(string? name) => CurrentValue;
         public IDisposable? OnChange(Action<AuthenticationSchemeOptions, string?> listener) => null;
+    }
+
+    private sealed class CapturingLoggerProvider : ILoggerProvider, ILogger
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = new();
+        public ILogger CreateLogger(string categoryName) => this;
+        public void Dispose() { }
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (Entries) Entries.Add((logLevel, formatter(state, exception)));
+        }
     }
 }

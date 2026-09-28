@@ -421,7 +421,7 @@ H-14 and H-4a are independent switches. Either can be in any mode. In
 | `H14_HUB_TOKEN_OK` | realtime, once per process | Info | proof that web is minting tokens this process verifies with the **current** key |
 | `H14_HUB_TOKEN_ROTATION` | realtime, boot | Warning | `SIGNALR_HUB_TOKEN_KEY_PREVIOUS` is set; a rotation is in progress |
 | `H14_HUB_TOKEN_PREVIOUS_KEY` | realtime, once per hub connection | Warning | a connection verified by the previous key; delete `SIGNALR_HUB_TOKEN_KEY_PREVIOUS` only once these stop |
-| `Hub connect refused (mode …, credential public-key\|invalid-token\|unknown, reason …)` | realtime, per refused request | Warning | a refused connect. `invalid-token` with reason `bad-signature` right after a key write means a web/realtime key mismatch. |
+| `Hub connect refused (mode …, credential public-key\|invalid-token\|unknown, reason …)` | realtime, per refused request | Warning | a refused connect. `invalid-token` with reason `bad-signature` right after a key write means a web/realtime key mismatch. Until §notify-auth-noise ships, every server-key notify also logs one `credential unknown` line here; that one is noise. |
 | `H14_HUB_TOKEN_REFUSED` | browser console | warn | the client fell back to the public key |
 | `[realtime] hub token disabled: …` | web | error | web's `SIGNALR_HUB_TOKEN_KEY` is short or equals another key. Web mints nothing (legacy). |
 
@@ -529,6 +529,45 @@ files are new, so the pick applies cleanly.
 requires `SIGNALR_API_KEY` at boot. In `enforced` the public key opens
 nothing on its own. Removing it is a later cleanup that needs a
 `RealtimeKeys` change.
+
+## §notify-auth-noise
+
+**Resolved in code (wave C batch 5, lane L6); ships only after H-4a and H-14 are `enforced`
+everywhere (A-45).** This item had been tracked only as a follow-up in the root
+`conductor/RUNBOOK.md` (2026-09-28 roll), not in "Other open items" below.
+
+**The noise.** `AddAuthentication("ApiKey")` (`Program.cs`) makes `ApiKey` the **default**
+authenticate scheme, so `UseAuthentication()` runs `ApiKeyAuthHandler` on every request,
+`POST /api/notify` included. Web sends `SIGNALR_SERVER_KEY` in `X-Api-Key`. The handler does not
+know that key: it is not the public key and not a hub token. So every server-key notify logged
+`Hub connect refused (mode transition, credential unknown, reason Invalid API key)`, although
+`NotifyAuth` then authorized the notify correctly. One false hub refusal per notify.
+
+**The fix.** `HandleAuthenticateAsync` returns `AuthenticateResult.NoResult()` for any path under
+`NotifyEndpoint.Path` (`/api/notify`, compared case-insensitively like routing), before it reads
+any credential. `/api/notifyall` or a hub path still goes through the full handler.
+
+**Why this option, and not "stop making ApiKey the default scheme".** The alternative would name
+the scheme on the hub (`RequireAuthorization` with `AuthenticationSchemes = "ApiKey"`) instead.
+Then the hub's principal would come from the authorization policy evaluator, not the
+authentication middleware. Nothing in this repo proves that the evaluator also sets the
+`IAuthenticateResultFeature` whose `ExpiresUtc` drives `CloseOnAuthenticationExpiration` (§H-14
+connection lifetime). The early return provably changes nothing else:
+
+- **Hub auth:** hub paths never match, so they run the identical code.
+- **Notify auth:** `NotifyAuth` reads `X-Api-Key` itself and never looks at `HttpContext.User`.
+  `/api/notify` carries no authorization requirement, so a `Fail` and a `NoResult` there lead to
+  the same thing: no principal, no challenge.
+- **H-14 modes:** `Program.cs` and every mode string and log line are unchanged.
+
+Tests: `Tests/ApiKeyAuthHandlerTests.cs`. In every mode, a `/api/notify` request gets `NoResult`
+and logs no `Hub connect refused`. A hub request with an unknown key still logs
+`credential unknown`.
+
+**Soak greps.** The current H-4a/H-14 soaks exclude `credential unknown` because of this noise.
+This change deploys only after enforcement (A-45), so those soaks keep their exclusion. From the
+deploy of this change on, drop the exclusion from every later search (key rotations, any
+re-soak). After that, a `credential unknown` line is a real refused hub connect.
 
 ## Other open items (not fixed by H-4a or H-14)
 
