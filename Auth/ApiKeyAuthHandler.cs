@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using System.Text.Encodings.Web;
+using ElevateRealtime.Hubs;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
 
@@ -25,6 +26,10 @@ public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptio
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
+        // /api/notify is authorized by NotifyAuth, not here; the default scheme must not judge (or log) its key. See AGENTS.md §notify-auth-noise.
+        if (Request.Path.StartsWithSegments(NotifyEndpoint.Path, StringComparison.OrdinalIgnoreCase))
+            return Task.FromResult(AuthenticateResult.NoResult());
+
         // Preferred: Authorization: Bearer <key> (SignalR JS client's
         // accessTokenFactory routes through this header). Fall back to the
         // legacy X-Api-Key header and ?apiKey= query param for older clients.
