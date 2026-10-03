@@ -26,8 +26,8 @@ public class ApiKeyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptio
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
-        // /api/notify is authorized by NotifyAuth, not here; the default scheme must not judge (or log) its key. See AGENTS.md §notify-auth-noise.
-        if (Request.Path.StartsWithSegments(NotifyEndpoint.Path, StringComparison.OrdinalIgnoreCase))
+        // The notify endpoint is authorized by NotifyAuth, not here; skip only on its routed metadata (a null endpoint is judged). See AGENTS.md §notify-auth-noise.
+        if (Context.GetEndpoint()?.Metadata.GetMetadata<NotifyEndpointMarker>() is not null)
             return Task.FromResult(AuthenticateResult.NoResult());
 
         // Preferred: Authorization: Bearer <key> (SignalR JS client's

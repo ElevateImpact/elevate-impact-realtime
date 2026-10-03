@@ -4,6 +4,11 @@ using Microsoft.AspNetCore.SignalR;
 
 namespace ElevateRealtime.Hubs;
 
+/// <summary>Endpoint metadata on POST /api/notify: the default ApiKey scheme returns NoResult for it. See AGENTS.md §notify-auth-noise.</summary>
+public sealed class NotifyEndpointMarker
+{
+}
+
 /// <summary>POST /api/notify: NotifyAuth gate + validation, then the caller's fan-out. See AGENTS.md §H-4a.</summary>
 public static class NotifyEndpoint
 {
@@ -26,5 +31,5 @@ public static class NotifyEndpoint
                 return Results.BadRequest(new { error = "eventType and group are required" });
 
             return await fanOut(request, hubContext);
-        });
+        }).WithMetadata(new NotifyEndpointMarker());
 }
