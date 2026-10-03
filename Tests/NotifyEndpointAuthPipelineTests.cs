@@ -19,8 +19,8 @@ namespace ElevateRealtime.Tests;
 /// <summary>
 /// /api/notify through Program.cs's real auth pipeline (implicit routing, then UseCors, then UseAuthentication with
 /// the default ApiKey scheme, then UseAuthorization): the routed marker, not the URL, keeps the hub scheme silent.
-/// A fifth test below reads Program.cs itself, since the pipeline this class builds copies that ordering rather than
-/// running it. See AGENTS.md §notify-auth-noise.
+/// The seventh test below reads Program.cs itself, since the pipeline this class builds copies that ordering rather
+/// than running it. See AGENTS.md §notify-auth-noise.
 /// </summary>
 public class NotifyEndpointAuthPipelineTests
 {
@@ -130,6 +130,47 @@ public class NotifyEndpointAuthPipelineTests
         Assert.DoesNotContain(pipeline.Log.Events, e => e.Template.StartsWith(HubRefusal));
     }
 
+    /// <summary>Refused notifies, end to end, in both modes: no key, an unknown key, and a valid hub token sent as a
+    /// Bearer header (the hub's credential; NotifyAuth reads X-Api-Key only) each get 401 from NotifyAuth, fan out to
+    /// no one, log NotifyAuth's own refusal (never a hub refusal), and never log the credential.</summary>
+    [Fact]
+    public async Task RefusedNotify_MissingKeyUnknownKeyOrHubBearerToken_Gets401_AndNeverFansOut()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var hubToken = HubTokens.Sign(HubKey,
+            $"{{\"sub\":\"hub-user-1\",\"aud\":\"{HubTokens.Audience}\",\"iat\":{now},\"exp\":{now + 300}}}");
+        var refusals = new (string Credential, string? Secret, Action<HttpRequestMessage> Present)[]
+        {
+            ("missing", null, _ => { }),
+            ("unknown", UnknownKey, request => request.Headers.Add(NotifyAuth.HeaderName, UnknownKey)),
+            ("missing", hubToken, request => request.Headers.Add("Authorization", $"Bearer {hubToken}")),
+        };
+
+        foreach (var (mode, keys, identity) in Modes())
+        {
+            foreach (var (credential, secret, present) in refusals)
+            {
+                await using var pipeline = await StartAsync(keys, identity);
+                var request = new HttpRequestMessage(HttpMethod.Post, NotifyEndpoint.Path)
+                {
+                    Content = JsonContent.Create(
+                        new { eventType = "ConversationUpdated", group = "a45-probe", payload = new { } }),
+                };
+                present(request);
+
+                var response = await pipeline.Client.SendAsync(request);
+
+                Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+                Assert.Equal(0, pipeline.FanOuts());
+                Assert.Contains(pipeline.Log.Events, e => e.Template.StartsWith("/api/notify refused")
+                    && e.Property("Mode") == mode && e.Property("Credential") == credential);
+                Assert.DoesNotContain(pipeline.Log.Events, e => e.Template.StartsWith(HubRefusal));
+                if (secret is not null)
+                    Assert.DoesNotContain(pipeline.Log.Events, e => e.Everything.Contains(secret));
+            }
+        }
+    }
+
     /// <summary>A path under /api/notify that routes nowhere carries no marker, so the hub scheme judges it (the prefix rule skipped it).</summary>
     [Fact]
     public async Task NotifyLookalikePath_RoutesNowhere_AndIsJudgedByTheHubScheme()
@@ -189,7 +230,7 @@ public class NotifyEndpointAuthPipelineTests
 
     /// <summary>
     /// Source guard, not a pipeline run: StartAsync above copies Program.cs's middleware order rather than executing
-    /// Program.cs, so none of the four request tests would notice a real reordering there. Program.cs never calls
+    /// Program.cs, so none of the six request tests would notice a real reordering there. Program.cs never calls
     /// UseRouting() today (WebApplication inserts routing implicitly, ahead of UseCors/UseAuthentication/
     /// UseAuthorization — see AGENTS.md §notify-auth-noise), but if one is ever added it must stay before
     /// UseAuthentication(), or the marker check in ApiKeyAuthHandler never sees the routed endpoint and the old
