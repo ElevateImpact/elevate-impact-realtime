@@ -1,5 +1,6 @@
 using System.Text.Encodings.Web;
 using ElevateRealtime.Auth;
+using ElevateRealtime.Hubs;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -165,39 +166,50 @@ public class ApiKeyAuthHandlerTests
         return (await handler.AuthenticateAsync(), log);
     }
 
+    /// <summary>Each row's notify keys match its label: "enforced" is H-4a enforced and H-14 enforced.</summary>
     private static IEnumerable<(string Mode, HubIdentityKeys Identity, RealtimeKeys Keys)> AllModes()
     {
-        var keys = new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify: true);
-        yield return ("legacy", new HubIdentityKeys(null, false, keys), keys);
-        yield return ("transition", new HubIdentityKeys(HubKey, true, keys), keys);
-        yield return ("enforced", new HubIdentityKeys(HubKey, false, keys), keys);
+        var transitionKeys = new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify: true);
+        var enforcedKeys = new RealtimeKeys(Key, ServerKey, acceptPublicKeyOnNotify: false);
+        yield return ("legacy", new HubIdentityKeys(null, false, transitionKeys), transitionKeys);
+        yield return ("transition", new HubIdentityKeys(HubKey, true, transitionKeys), transitionKeys);
+        yield return ("enforced", new HubIdentityKeys(HubKey, false, enforcedKeys), enforcedKeys);
     }
 
+    /// <summary>What routing sets for POST /api/notify: an endpoint carrying the marker MapNotifyEndpoint adds.</summary>
+    private static Endpoint NotifyRoutedEndpoint()
+        => new(_ => Task.CompletedTask, new EndpointMetadataCollection(new NotifyEndpointMarker()), "notify");
+
     /// <summary>The soak noise: the server key on /api/notify used to log a hub refusal on every notify.</summary>
-    [Theory]
-    [InlineData("/api/notify")]
-    [InlineData("/API/Notify")]
-    [InlineData("/api/notify/")]
-    public async Task NotifyRequest_IsNotJudgedOrLoggedByTheHubScheme(string path)
+    [Fact]
+    public async Task NotifyEndpoint_IsNotJudgedOrLoggedByTheHubScheme()
     {
         foreach (var (mode, identity, keys) in AllModes())
         {
             foreach (var credential in new[] { ServerKey, "wrong-notify-key", Key })
             {
-                var (result, log) = await AuthenticateLogged(path, identity, keys,
-                    ctx => ctx.Request.Headers["X-Api-Key"] = credential);
-                Assert.True(result.None, $"{mode} {path}");
+                var (result, log) = await AuthenticateLogged(NotifyEndpoint.Path, identity, keys, ctx =>
+                {
+                    ctx.SetEndpoint(NotifyRoutedEndpoint());
+                    ctx.Request.Headers["X-Api-Key"] = credential;
+                });
+                Assert.True(result.None, mode);
                 Assert.DoesNotContain(log.Entries, e => e.Message.Contains("Hub connect refused"));
             }
         }
     }
 
-    /// <summary>Control: the skip is exactly /api/notify, so a hub connect with an unknown key still logs its refusal.</summary>
+    /// <summary>
+    /// Control: only the routed marker skips. A path alone is judged, /api/notify included when no endpoint
+    /// was routed (the fail-safe), so a hub connect with an unknown key still logs its refusal.
+    /// </summary>
     [Theory]
     [InlineData("/hubs/elevate")]
     [InlineData("/hubs/elevate/negotiate")]
     [InlineData("/api/notifyall")]
-    public async Task HubRequest_WithUnknownKey_StillLogsTheRefusal(string path)
+    [InlineData("/api/notify")]
+    [InlineData("/api/notify/extra")]
+    public async Task RequestWithoutTheMarker_WithUnknownKey_StillLogsTheRefusal(string path)
     {
         foreach (var (mode, identity, keys) in AllModes())
         {
@@ -207,6 +219,23 @@ public class ApiKeyAuthHandlerTests
             Assert.False(result.None, mode);
             Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
                 && e.Message.Contains("Hub connect refused") && e.Message.Contains("credential unknown"));
+        }
+    }
+
+    /// <summary>A routed endpoint without the marker (e.g. the hub's) is judged: the rule is the marker, not "any endpoint".</summary>
+    [Fact]
+    public async Task RoutedEndpointWithoutTheMarker_IsJudged()
+    {
+        foreach (var (mode, identity, keys) in AllModes())
+        {
+            var (result, log) = await AuthenticateLogged(NotifyEndpoint.Path, identity, keys, ctx =>
+            {
+                ctx.SetEndpoint(new Endpoint(_ => Task.CompletedTask, EndpointMetadataCollection.Empty, "hub"));
+                ctx.Request.Headers["X-Api-Key"] = ServerKey;
+            });
+            Assert.False(result.None, mode);
+            Assert.False(result.Succeeded, mode);
+            Assert.Contains(log.Entries, e => e.Message.Contains("Hub connect refused") && e.Message.Contains("credential unknown"));
         }
     }
 

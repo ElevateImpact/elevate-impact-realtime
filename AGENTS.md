@@ -421,7 +421,7 @@ H-14 and H-4a are independent switches. Either can be in any mode. In
 | `H14_HUB_TOKEN_OK` | realtime, once per process | Info | proof that web is minting tokens this process verifies with the **current** key |
 | `H14_HUB_TOKEN_ROTATION` | realtime, boot | Warning | `SIGNALR_HUB_TOKEN_KEY_PREVIOUS` is set; a rotation is in progress |
 | `H14_HUB_TOKEN_PREVIOUS_KEY` | realtime, once per hub connection | Warning | a connection verified by the previous key; delete `SIGNALR_HUB_TOKEN_KEY_PREVIOUS` only once these stop |
-| `Hub connect refused (mode …, credential public-key\|invalid-token\|unknown, reason …)` | realtime, per refused request | Warning | a refused connect. `invalid-token` with reason `bad-signature` right after a key write means a web/realtime key mismatch. Until §notify-auth-noise ships, every server-key notify also logs one `credential unknown` line here; that one is noise. |
+| `Hub connect refused (mode …, credential public-key\|invalid-token\|unknown, reason …)` | realtime, per refused request | Warning | a refused connect. `invalid-token` with reason `bad-signature` right after a key write means a web/realtime key mismatch. On a build without §notify-auth-noise (production `main@59c43073` until the next realtime release), every server-key notify also logs one `credential unknown` line here; that one is noise. On a build **with** §notify-auth-noise, a `credential unknown` line can still appear for a wrong-method request to `/api/notify` (GET, PUT, HEAD, hitting ASP.NET Core's 405 rejection endpoint) or for a path under `/api/notify` that matches no route at all (404, e.g. `/api/notify/extra`): both carry no marker either, so the handler still judges them. Treat that line as a probe against the notify path in either case, not noise: a correctly-routed `POST /api/notify` no longer logs one. |
 | `H14_HUB_TOKEN_REFUSED` | browser console | warn | the client fell back to the public key |
 | `[realtime] hub token disabled: …` | web | error | web's `SIGNALR_HUB_TOKEN_KEY` is short or equals another key. Web mints nothing (legacy). |
 
@@ -532,8 +532,17 @@ nothing on its own. Removing it is a later cleanup that needs a
 
 ## §notify-auth-noise
 
-**Resolved in code (wave C batch 5, lane L6); ships only after H-4a and H-14 are `enforced`
-everywhere (A-45).** This item had been tracked only as a follow-up in the root
+**Status.** The fix landed in two steps:
+
+- **Batch 5 (wave C batch 5, lane L6).** Added a URL-prefix rule (`b2d2b4d6`). It was held until
+  H-4a and H-14 were `enforced` in all three environments (A-45). It merged to `dev` as
+  `478df5fc` on 2026-10-02 and is deployed to dev and research-platform.
+- **Batch 9 (lane L6, branch `fix/realtime-auth-followups`).** Acted on the A-45 review's
+  follow-ups. The prefix rule became an endpoint-metadata rule (L-1). Two tests were added: a
+  full-pipeline test (L-2) and a test row that is enforced in both modes (I-1).
+
+Production realtime stays on `main@59c43073`, without either change, until the owner schedules a
+realtime dev→main release. This item had been tracked only as a follow-up in the root
 `conductor/RUNBOOK.md` (2026-09-28 roll), not in "Other open items" below.
 
 **The noise.** `AddAuthentication("ApiKey")` (`Program.cs`) makes `ApiKey` the **default**
@@ -543,9 +552,54 @@ know that key: it is not the public key and not a hub token. So every server-key
 `Hub connect refused (mode transition, credential unknown, reason Invalid API key)`, although
 `NotifyAuth` then authorized the notify correctly. One false hub refusal per notify.
 
-**The fix.** `HandleAuthenticateAsync` returns `AuthenticateResult.NoResult()` for any path under
-`NotifyEndpoint.Path` (`/api/notify`, compared case-insensitively like routing), before it reads
-any credential. `/api/notifyall` or a hub path still goes through the full handler.
+**The fix: skip on the routed endpoint's marker.** `MapNotifyEndpoint` (`Hubs/NotifyEndpoint.cs`)
+adds `.WithMetadata(new NotifyEndpointMarker())` to its `MapPost`. `HandleAuthenticateAsync`
+returns `AuthenticateResult.NoResult()` when
+`Context.GetEndpoint()?.Metadata.GetMetadata<NotifyEndpointMarker>() is not null`, before it reads
+any credential. Every other request goes through the full handler: `/api/notifyall`,
+`/api/notify/extra` and every hub path.
+
+**Why the endpoint is already set when the scheme runs.** `Program.cs` never calls `UseRouting()`.
+In that case `WebApplication` inserts routing at the start of the pipeline, ahead of `UseCors`,
+`UseAuthentication` and `UseAuthorization`. So routing has already chosen the endpoint, or none,
+by the time the default scheme runs. `UseAuthorization` and the hub's `[Authorize]` depend on the
+same ordering.
+
+If someone adds an explicit `app.UseRouting()`, it must stay before `app.UseAuthentication()`.
+Otherwise the handler never sees the marker and the old noise line returns. No check is skipped
+(see the fail-safe below). The four HTTP-level cases in `Tests/NotifyEndpointAuthPipelineTests.cs`
+would **not** catch this: that file's own `StartAsync` copies `Program.cs`'s middleware order
+rather than running `Program.cs`, so reordering `Program.cs` does not change what the copy does.
+The same file's source guard does: it reads `Program.cs` itself and turns red on an out-of-order
+`UseRouting()` there (see "Tests" below).
+
+**Why the prefix rule was fragile.** The batch-5 rule was
+`Request.Path.StartsWithSegments("/api/notify", OrdinalIgnoreCase)`: a second, hand-written copy
+of a decision that routing already makes, and the two could drift.
+
+- **Unrouted paths were skipped.** Paths that route nowhere, such as `/api/notify/extra`, got
+  `NoResult` instead of being judged. This was harmless only because nothing is mapped under that
+  prefix.
+- **New endpoints inherited the skip.** Any endpoint mapped later under `/api/notify/...`, such as a
+  batch or status route, would have been skipped silently even if it had no gate of its own.
+- **Path normalisation was duplicated.** Trailing slash, letter case and `PathBase` are routing's
+  decisions, and the prefix compare had to re-derive them.
+
+The marker sits on exactly one endpoint: the one whose handler calls `NotifyAuth.IsAuthorized`. A
+new endpoint gets the skip only by opting in, so the skip always travels with its gate.
+
+**Fail-safe on a null endpoint.** When no endpoint was routed, `GetEndpoint()` is null and the
+handler judges the request exactly as it did before batch 5. That happens for three reasons: a
+404 (no route matches the path at all), a 405 (a non-POST request to `/api/notify` — GET, PUT,
+HEAD — routes to ASP.NET Core's method-not-allowed rejection endpoint, which carries no marker
+either), or routing ordered after authentication. Only the last of those is noise: a configuration
+artifact that cannot occur today (`Program.cs` never calls `UseRouting()`; see below), not a
+signal about the request. The 404 and 405 cases are both real: with the server key in
+`X-Api-Key`, the handler judges the request exactly as the misordered-routing case would and logs
+the same `credential unknown` line, and because a correctly-routed `POST /api/notify` no longer
+logs anything here, that line on the notify path is a probe worth looking at either way. The worst
+outcome in any case is a `credential unknown` log line, never a skipped check: the skip only ever
+returns `NoResult`, never `Success`, so it cannot grant a principal.
 
 **Why this option, and not "stop making ApiKey the default scheme".** The alternative would name
 the scheme on the hub (`RequireAuthorization` with `AuthenticationSchemes = "ApiKey"`) instead.
@@ -554,20 +608,62 @@ authentication middleware. Nothing in this repo proves that the evaluator also s
 `IAuthenticateResultFeature` whose `ExpiresUtc` drives `CloseOnAuthenticationExpiration` (§H-14
 connection lifetime). The early return provably changes nothing else:
 
-- **Hub auth:** hub paths never match, so they run the identical code.
+- **Hub auth:** hub endpoints carry no marker, so they run the identical code.
 - **Notify auth:** `NotifyAuth` reads `X-Api-Key` itself and never looks at `HttpContext.User`.
   `/api/notify` carries no authorization requirement, so a `Fail` and a `NoResult` there lead to
   the same thing: no principal, no challenge.
 - **H-14 modes:** `Program.cs` and every mode string and log line are unchanged.
 
-Tests: `Tests/ApiKeyAuthHandlerTests.cs`. In every mode, a `/api/notify` request gets `NoResult`
-and logs no `Hub connect refused`. A hub request with an unknown key still logs
-`credential unknown`.
+**Tests.**
 
-**Soak greps.** The current H-4a/H-14 soaks exclude `credential unknown` because of this noise.
-This change deploys only after enforcement (A-45), so those soaks keep their exclusion. From the
-deploy of this change on, drop the exclusion from every later search (key rotations, any
-re-soak). After that, a `credential unknown` line is a real refused hub connect.
+- **`Tests/ApiKeyAuthHandlerTests.cs`.** The "enforced" row is enforced for both H-4a and H-14
+  (review item I-1). In every mode, a request whose endpoint carries the marker gets `NoResult`
+  and logs no `Hub connect refused`. Two kinds of request are judged and log `credential unknown`:
+  one with no routed endpoint (`/api/notify` included), and one whose endpoint lacks the marker.
+- **`Tests/NotifyEndpointAuthPipelineTests.cs` (review item L-2).** Six tests, not four. Five run
+  `Program.cs`'s auth pipeline on TestServer: logging, scheme, singletons, middleware order
+  (`UseCors`, then `UseAuthentication`, then `UseAuthorization`, matching `Program.cs`) and the
+  real `[Authorize]` hub all match production. Those five requests:
+  - a server-key `POST /api/notify` returns 200, fans out, and logs no hub refusal;
+  - a public-key notify in enforced mode returns 401 and is refused by NotifyAuth alone;
+  - `POST /api/notify/extra` returns 404 and is judged by the hub scheme;
+  - a server-key `GET /api/notify` returns 405 and is judged by the hub scheme the same way —
+    pinning the 405 half of the fail-safe claim above;
+  - an unknown-key hub negotiate returns 401 and logs the refusal line without the key.
+
+  The sixth is a source guard, not a request: it reads `Program.cs` directly and fails if an
+  `app.UseRouting()` call there would run after `app.UseAuthentication()`. The five requests
+  above cannot catch that ordering mistake themselves, because their own `StartAsync` copies
+  `Program.cs`'s middleware order instead of running it (see above).
+
+**Soak greps.** `478df5fc` deployed this fix to dev and research-platform on 2026-10-02. In those
+two environments a `credential unknown` line is now a real refused request, so drop the exclusion
+from every later search there (key rotations, any re-soak). Production still runs
+`main@59c43073` and still logs one `credential unknown` line per server-key notify. Production
+greps keep the exclusion until a realtime release ships this section.
+
+**Still open (info items from the A-45 review).**
+
+- **I-2: notify probes with a malformed body leave no log line.** Before batch 5, every request to
+  `/api/notify` produced a hub refusal line. That line was noise, but it also happened to record
+  probes. Now a body that does not bind (malformed JSON, wrong content type, empty body) is
+  rejected by minimal-API parameter binding with 400/415 before the endpoint handler runs.
+  `NotifyAuth.IsAuthorized` never runs, and the binding failure logs at Debug under
+  `Microsoft.AspNetCore`, which `CredentialLogSafety` filters to Warning.
+
+  A well-formed body with a bad key still logs `/api/notify refused`. Returning 400 before the key
+  check predates batch 5. Two fixes would restore visibility, and both change the endpoint, so
+  this follow-up does neither:
+  - take `HttpContext` only and deserialize the body after `NotifyAuth`; or
+  - log binding failures at Warning, without the body.
+- **I-3: `Auth` and `Hubs` depend on each other.** `Auth/ApiKeyAuthHandler.cs` imports
+  `ElevateRealtime.Hubs` for `NotifyEndpointMarker` (before batch 9 it imported it for
+  `NotifyEndpoint.Path`). `Hubs/NotifyEndpoint.cs` and `Hubs/ElevateHub.cs` import
+  `ElevateRealtime.Auth` for `NotifyAuth`, `RealtimeKeys` and `HubIdentityKeys`. Both namespaces
+  live in one assembly, so this compiles and runs; the cost is layering only. The cheapest fix is
+  to move `NotifyEndpointMarker` into `ElevateRealtime.Auth`, beside the `NotifyAuth` gate it pairs
+  with, so that `Auth` stops importing `Hubs`. The batch-9 contract pinned the marker to
+  `Hubs/NotifyEndpoint.cs`, which is why it is still there.
 
 ## Other open items (not fixed by H-4a or H-14)
 
