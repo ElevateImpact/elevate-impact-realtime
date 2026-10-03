@@ -567,7 +567,7 @@ same ordering.
 
 If someone adds an explicit `app.UseRouting()`, it must stay before `app.UseAuthentication()`.
 Otherwise the handler never sees the marker and the old noise line returns. No check is skipped
-(see the fail-safe below). The four HTTP-level cases in `Tests/NotifyEndpointAuthPipelineTests.cs`
+(see the fail-safe below). The six HTTP-level cases in `Tests/NotifyEndpointAuthPipelineTests.cs`
 would **not** catch this: that file's own `StartAsync` copies `Program.cs`'s middleware order
 rather than running `Program.cs`, so reordering `Program.cs` does not change what the copy does.
 The same file's source guard does: it reads `Program.cs` itself and turns red on an out-of-order
@@ -588,18 +588,24 @@ of a decision that routing already makes, and the two could drift.
 The marker sits on exactly one endpoint: the one whose handler calls `NotifyAuth.IsAuthorized`. A
 new endpoint gets the skip only by opting in, so the skip always travels with its gate.
 
-**Fail-safe on a null endpoint.** When no endpoint was routed, `GetEndpoint()` is null and the
-handler judges the request exactly as it did before batch 5. That happens for three reasons: a
-404 (no route matches the path at all), a 405 (a non-POST request to `/api/notify` — GET, PUT,
-HEAD — routes to ASP.NET Core's method-not-allowed rejection endpoint, which carries no marker
-either), or routing ordered after authentication. Only the last of those is noise: a configuration
-artifact that cannot occur today (`Program.cs` never calls `UseRouting()`; see below), not a
-signal about the request. The 404 and 405 cases are both real: with the server key in
-`X-Api-Key`, the handler judges the request exactly as the misordered-routing case would and logs
-the same `credential unknown` line, and because a correctly-routed `POST /api/notify` no longer
-logs anything here, that line on the notify path is a probe worth looking at either way. The worst
-outcome in any case is a `credential unknown` log line, never a skipped check: the skip only ever
-returns `NoResult`, never `Success`, so it cannot grant a principal.
+**Fail-safe: no marker, no skip.** The handler skips only when the routed endpoint carries the
+marker. Every other request is judged exactly as it was before batch 5. On the notify path that
+happens in two different shapes:
+
+- **A null endpoint.** `GetEndpoint()` is null when no route matches the path at all (a 404, such
+  as `/api/notify/extra`), or when routing is ordered after authentication. Only the misordered
+  case is noise: a configuration artifact that cannot occur today (`Program.cs` never calls
+  `UseRouting()`; see below), not a signal about the request.
+- **A non-null endpoint without the marker.** A non-POST request to `/api/notify` (GET, PUT,
+  HEAD) is routed to ASP.NET Core's 405 method-not-allowed rejection endpoint. `GetEndpoint()` is
+  not null there, but that endpoint carries no `NotifyEndpointMarker`, so the handler judges the
+  request too.
+
+A 404 or a 405 on the notify path is a probe, not noise. With the server key in `X-Api-Key`, the
+handler logs the same `credential unknown` line the misordered-routing case would, and because a
+correctly-routed `POST /api/notify` no longer logs anything here, that line is worth looking at
+either way. The worst outcome in any case is a `credential unknown` log line, never a skipped
+check: the skip only ever returns `NoResult`, never `Success`, so it cannot grant a principal.
 
 **Why this option, and not "stop making ApiKey the default scheme".** The alternative would name
 the scheme on the hub (`RequireAuthorization` with `AuthenticationSchemes = "ApiKey"`) instead.
@@ -620,19 +626,23 @@ connection lifetime). The early return provably changes nothing else:
   (review item I-1). In every mode, a request whose endpoint carries the marker gets `NoResult`
   and logs no `Hub connect refused`. Two kinds of request are judged and log `credential unknown`:
   one with no routed endpoint (`/api/notify` included), and one whose endpoint lacks the marker.
-- **`Tests/NotifyEndpointAuthPipelineTests.cs` (review item L-2).** Six tests, not four. Five run
+- **`Tests/NotifyEndpointAuthPipelineTests.cs` (review item L-2).** Seven tests. Six run
   `Program.cs`'s auth pipeline on TestServer: logging, scheme, singletons, middleware order
   (`UseCors`, then `UseAuthentication`, then `UseAuthorization`, matching `Program.cs`) and the
-  real `[Authorize]` hub all match production. Those five requests:
+  real `[Authorize]` hub all match production. Those six requests:
   - a server-key `POST /api/notify` returns 200, fans out, and logs no hub refusal;
   - a public-key notify in enforced mode returns 401 and is refused by NotifyAuth alone;
-  - `POST /api/notify/extra` returns 404 and is judged by the hub scheme;
+  - a `POST /api/notify` with no key, with an unknown key, or with a valid hub token sent as
+    `Authorization: Bearer` (the hub's credential, which notify never reads) returns 401 from
+    NotifyAuth in both modes, with no fan-out, no hub refusal and no credential in the log
+    (batch 9b, PR #6 review low);
+  - `POST /api/notify/extra` returns 404 and is judged by the hub scheme (a null endpoint);
   - a server-key `GET /api/notify` returns 405 and is judged by the hub scheme the same way —
-    pinning the 405 half of the fail-safe claim above;
+    pinning the non-null, marker-less half of the fail-safe claim above;
   - an unknown-key hub negotiate returns 401 and logs the refusal line without the key.
 
-  The sixth is a source guard, not a request: it reads `Program.cs` directly and fails if an
-  `app.UseRouting()` call there would run after `app.UseAuthentication()`. The five requests
+  The seventh is a source guard, not a request: it reads `Program.cs` directly and fails if an
+  `app.UseRouting()` call there would run after `app.UseAuthentication()`. The six requests
   above cannot catch that ordering mistake themselves, because their own `StartAsync` copies
   `Program.cs`'s middleware order instead of running it (see above).
 
